@@ -227,6 +227,9 @@ public class ProxyMiddleware
                 _logger.LogWarning("Key ...{KeySuffix} returned 402 (quota exceeded for this request), trying next key",
                     apiKey[^6..]);
 
+                // Move this key to the end of the pool — it still works for
+                // smaller requests, but shouldn't block the queue
+                _keyPool.SendToBack(apiKey);
                 triedKeys.Add(apiKey);
 
                 // Drain body before dispose

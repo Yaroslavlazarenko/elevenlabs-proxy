@@ -108,6 +108,31 @@ public class KeyPool
     }
 
     /// <summary>
+    /// Move a key to the end of the pool array so it is tried last
+    /// in the round-robin rotation. Used for 402 (quota exceeded) —
+    /// the key still works for smaller requests but shouldn't be the
+    /// first one picked.
+    /// </summary>
+    public void SendToBack(string key)
+    {
+        // Find the key's current position
+        var idx = Array.FindIndex(_keys, k => k.Key == key);
+        if (idx < 0 || idx == _keys.Length - 1) return;
+
+        // Shift everything after it one position left, put the key at the end
+        var entry = _keys[idx];
+        Array.Copy(_keys, idx + 1, _keys, idx, _keys.Length - idx - 1);
+        _keys[^1] = entry;
+
+        // Reset round-robin index to 0 so the next Acquire() starts from
+        // the beginning of the reshuffled array
+        Interlocked.Exchange(ref _index, 0);
+
+        Console.WriteLine(
+            $"[key-pool] Key ...{key[^6..]} moved to back of queue");
+    }
+
+    /// <summary>
     /// Snapshot of every key's status — used by the /health endpoint.
     /// Key values are masked (only last 6 chars shown) for security.
     /// </summary>
