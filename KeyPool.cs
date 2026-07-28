@@ -1,3 +1,17 @@
+// ============================================================================
+// KeyPool.cs — Thread-safe round-robin API key pool with cooldown
+//
+// How it works:
+//   - Keys are stored in a fixed-size array; an atomic counter provides
+//     lock-free round-robin rotation across concurrent requests.
+//   - When ElevenLabs responds with 429, the key is "cooled down" for a
+//     configurable period (or the Retry-After value from the response).
+//     During cooldown the key is skipped and the next available one is used.
+//   - If ALL keys are on cooldown, the caller gets null + the number of
+//     milliseconds until the soonest key recovers (so the proxy can return
+//     a meaningful Retry-After to the client).
+// ============================================================================
+
 using System.Collections.Concurrent;
 
 namespace ElevenLabsProxy;
@@ -9,10 +23,12 @@ namespace ElevenLabsProxy;
 public class KeyPool
 {
     private readonly KeyEntry[] _keys;
-    private int _index;
+    private int _index; // atomically incremented for round-robin
 
+    /// <summary>Total number of keys in the pool.</summary>
     public int Size => _keys.Length;
 
+    /// <summary>Number of keys not currently on cooldown.</summary>
     public int AvailableCount
     {
         get
@@ -22,6 +38,8 @@ public class KeyPool
         }
     }
 
+    /// <param name="keys">Non-empty list of ElevenLabs API keys.</param>
+    /// <exception cref="ArgumentException">Thrown when the list is empty.</exception>
     public KeyPool(IReadOnlyList<string> keys)
     {
         if (keys.Count == 0)
@@ -32,19 +50,23 @@ public class KeyPool
 
     /// <summary>
     /// Acquire the next available key via round-robin.
-    /// Returns the key string, or null if all keys are on cooldown.
-    /// When null, <paramref name="retryAfterMs"/> indicates when the soonest key recovers.
     /// </summary>
+    /// <param name="retryAfterMs">
+    /// When no key is available, set to the number of milliseconds until
+    /// the soonest key comes off cooldown.
+    /// </param>
+    /// <returns>API key string, or <c>null</c> if all keys are on cooldown.</returns>
     public string? Acquire(out long retryAfterMs)
     {
         var now = DateTimeOffset.UtcNow;
         var len = _keys.Length;
 
-        // Round-robin: start from current index, wrap around
+        // Scan all keys starting from the current round-robin position.
+        // Interlocked.Add ensures thread-safe rotation without locks.
         for (int i = 0; i < len; i++)
         {
             var idx = (Interlocked.Add(ref _index, 1) - 1) % len;
-            if (idx < 0) idx += len; // handle overflow
+            if (idx < 0) idx += len; // guard against int overflow wrapping negative
             var entry = _keys[idx];
 
             if (entry.AvailableAt <= now)
@@ -54,7 +76,7 @@ public class KeyPool
             }
         }
 
-        // All on cooldown — find the soonest recovery
+        // Every key is on cooldown — report when the first one recovers
         var soonest = _keys.Min(k => k.AvailableAt);
         var diff = soonest - now;
         retryAfterMs = Math.Max(0, (long)diff.TotalMilliseconds);
@@ -62,13 +84,21 @@ public class KeyPool
     }
 
     /// <summary>
-    /// Put a key on cooldown after receiving a 429.
+    /// Put a key on cooldown after receiving a 429 from ElevenLabs.
     /// </summary>
+    /// <param name="key">The API key that was rate-limited.</param>
+    /// <param name="retryAfterMs">
+    /// Value from the upstream Retry-After header (converted to ms), if present.
+    /// </param>
+    /// <param name="defaultCooldownMs">
+    /// Fallback cooldown when no Retry-After header was provided.
+    /// </param>
     public void MarkRateLimited(string key, int? retryAfterMs = null, int defaultCooldownMs = 60_000)
     {
         var entry = _keys.FirstOrDefault(k => k.Key == key);
         if (entry == null) return;
 
+        // Prefer the server-provided Retry-After; fall back to the configured default
         var cooldown = retryAfterMs is > 0 ? retryAfterMs.Value : defaultCooldownMs;
         entry.AvailableAt = DateTimeOffset.UtcNow.AddMilliseconds(cooldown);
 
@@ -78,7 +108,8 @@ public class KeyPool
     }
 
     /// <summary>
-    /// Return status of all keys for the health endpoint.
+    /// Snapshot of every key's status — used by the /health endpoint.
+    /// Key values are masked (only last 6 chars shown) for security.
     /// </summary>
     public IReadOnlyList<KeyStatus> GetStatus()
     {
@@ -94,14 +125,21 @@ public class KeyPool
         }).ToArray();
     }
 
+    // ── Internal key wrapper ───────────────────────────────────────────
     private class KeyEntry
     {
         public string Key { get; }
+
+        /// <summary>
+        /// UTC timestamp after which this key can be used again.
+        /// <c>DateTimeOffset.MinValue</c> means "available immediately".
+        /// </summary>
         public DateTimeOffset AvailableAt { get; set; } = DateTimeOffset.MinValue;
 
         public KeyEntry(string key) => Key = key;
     }
 
+    /// <summary>DTO exposed by <see cref="GetStatus"/> for the health endpoint.</summary>
     public class KeyStatus
     {
         public int Index { get; set; }
