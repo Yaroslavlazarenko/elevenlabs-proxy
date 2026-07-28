@@ -1,0 +1,14 @@
+services:
+  elevenlabs-proxy:
+    build: .
+    container_name: elevenlabs-proxy
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - ASPNETCORE_URLS=http://+:3000
+      - ELEVENLABS_API_KEYS_FILE=/app/keys.txt
+    volumes:
+      - ./keys.txt:/app/keys.txt:ro

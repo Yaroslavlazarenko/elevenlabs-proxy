@@ -1,0 +1,12 @@
+bin/
+obj/
+.env
+keys.txt
+.git
+.gitignore
+.dockerignore
+.claude
+*.md
+.env.example
+*.sln
+.vs/

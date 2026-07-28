@@ -1,0 +1,6 @@
+bin/
+obj/
+.env
+keys.txt
+.vs/
+*.user
