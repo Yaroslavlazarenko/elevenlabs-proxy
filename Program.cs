@@ -81,6 +81,13 @@ builder.Services.AddHttpClient("ElevenLabs")
 
 var app = builder.Build();
 
+// ── Enable WebSocket support ───────────────────────────────────────────
+// Required for proxying ElevenLabs real-time WebSocket endpoints:
+//   - /v1/text-to-speech/{voice_id}/stream-input       (streaming TTS input)
+//   - /v1/text-to-speech/{voice_id}/multi-stream-input (multi-context TTS)
+//   - /v1/speech-to-text/realtime                       (real-time STT)
+app.UseWebSockets();
+
 // ── Health / readiness endpoints (no authentication required) ──────────
 // GET /health — returns status of every key in the pool (available or cooling down)
 app.MapGet("/health", (KeyPool pool) => Results.Ok(new
@@ -132,7 +139,11 @@ app.UseWhen(
             await next();
         });
 
-        // All authenticated requests are forwarded to ElevenLabs via ProxyMiddleware
+        // WebSocket requests are handled by WebSocketProxyMiddleware
+        // (bidirectional frame relay for TTS streaming input, STT realtime, etc.)
+        proxyApp.UseMiddleware<WebSocketProxyMiddleware>();
+
+        // All other authenticated HTTP requests are forwarded to ElevenLabs
         proxyApp.UseMiddleware<ProxyMiddleware>();
     });
 

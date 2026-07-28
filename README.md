@@ -10,12 +10,12 @@ Clients use the proxy exactly like they would use the ElevenLabs API directly �
 ┌────────┐   xi-api-key: PROXY_KEY   ┌───────────┐   xi-api-key: REAL_KEY_N   ┌────────────┐
 │ Client │ ──────────────────────────▶│   Proxy   │ ─────────────────────────▶ │ ElevenLabs │
 │        │ ◀──────────────────────────│           │ ◀───────────────────────── │    API     │
-└────────┘       audio/json           └───────────┘       audio/json           └────────────┘
+└────────┘    audio/json/websocket    └───────────┘    audio/json/websocket    └────────────┘
                                            │
                                       Key Pool (round-robin)
                                       ┌─────┬─────┬─────┐
                                       │ K1  │ K2  │ K3  │
-                                      │ ✔️   │ 💤  │ ✔️   │
+                                      │ OK  │ 429 │ OK  │
                                       └─────┴─────┴─────┘
 ```
 
@@ -24,6 +24,17 @@ Clients use the proxy exactly like they would use the ElevenLabs API directly �
 3. Proxy picks the next available key from the pool (round-robin)
 4. Request is forwarded to ElevenLabs with the real API key
 5. Response is streamed back to the client
+
+### Streaming Support
+
+The proxy fully supports all ElevenLabs streaming modes:
+
+| Mode | Endpoints | How it works |
+|---|---|---|
+| **HTTP chunked** | `POST /v1/text-to-speech/{id}/stream`, `POST /v1/speech-to-speech/{id}/stream` | Audio chunks are flushed to the client immediately as they arrive from upstream — no buffering. |
+| **WebSocket** | `GET /v1/text-to-speech/{id}/stream-input` | Bidirectional frame relay. Client sends text chunks, receives audio chunks in real-time. |
+| **WebSocket multi-context** | `GET /v1/text-to-speech/{id}/multi-stream-input` | Same relay, multiple independent audio streams over one connection. |
+| **WebSocket STT** | `GET /v1/speech-to-text/realtime` | Real-time speech-to-text. Audio frames in, transcription frames out. |
 
 ### Error Handling
 
@@ -82,11 +93,21 @@ client = ElevenLabs(
     base_url="http://localhost:3000",       # proxy address
 )
 
+# Standard TTS
 audio = client.text_to_speech.convert(
     voice_id="JBFqnCBsd6RMkjVDRZzb",
     text="Hello from the proxy!",
     model_id="eleven_flash_v2_5",
 )
+
+# Streaming TTS
+audio_stream = client.text_to_speech.stream(
+    voice_id="JBFqnCBsd6RMkjVDRZzb",
+    text="This audio is streamed chunk by chunk.",
+    model_id="eleven_flash_v2_5",
+)
+for chunk in audio_stream:
+    process(chunk)
 ```
 
 ### JavaScript/TypeScript (ElevenLabs SDK)
@@ -98,16 +119,60 @@ const client = new ElevenLabsClient({
     apiKey: "your-secret-proxy-key",
     baseUrl: "http://localhost:3000",
 });
+
+// Streaming TTS
+const stream = await client.textToSpeech.stream("JBFqnCBsd6RMkjVDRZzb", {
+    text: "Streamed through the proxy!",
+    modelId: "eleven_flash_v2_5",
+});
 ```
 
 ### cURL
 
 ```bash
+# Standard TTS
 curl -X POST http://localhost:3000/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb \
   -H "xi-api-key: your-secret-proxy-key" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello!", "model_id": "eleven_flash_v2_5"}' \
   --output speech.mp3
+
+# Streaming TTS
+curl -X POST http://localhost:3000/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb/stream \
+  -H "xi-api-key: your-secret-proxy-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Streamed!", "model_id": "eleven_flash_v2_5"}' \
+  --output speech_stream.mp3
+```
+
+### WebSocket (Python)
+
+```python
+import asyncio, websockets, json
+
+async def realtime_tts():
+    uri = "ws://localhost:3000/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb/stream-input?model_id=eleven_flash_v2_5"
+    headers = {"xi-api-key": "your-secret-proxy-key"}
+
+    async with websockets.connect(uri, additional_headers=headers) as ws:
+        # Init
+        await ws.send(json.dumps({
+            "text": " ",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+        }))
+        # Send text
+        await ws.send(json.dumps({"text": "Hello from WebSocket!"}))
+        # Close signal
+        await ws.send(json.dumps({"text": ""}))
+        # Receive audio chunks
+        async for msg in ws:
+            data = json.loads(msg)
+            if data.get("audio"):
+                process_audio(data["audio"])
+            if data.get("isFinal"):
+                break
+
+asyncio.run(realtime_tts())
 ```
 
 ## Configuration
@@ -132,7 +197,7 @@ All settings are configured via environment variables (in `.env`):
 
 ### Proxy (all ElevenLabs routes)
 
-All requests except `/health` and `/ready` are proxied to ElevenLabs. Requires `xi-api-key` header with the proxy key.
+All requests except `/health` and `/ready` are proxied to ElevenLabs. Both HTTP and WebSocket requests are supported. Requires `xi-api-key` header with the proxy key.
 
 ### Health Check
 
@@ -164,15 +229,16 @@ Returns `200` if at least one key is available, `503` if all keys are on cooldow
 
 ```
 elevenlabs-proxy/
-├── Program.cs              # Entry point, config loading, middleware pipeline
-├── ProxySettings.cs        # Configuration model
-├── KeyPool.cs              # Thread-safe round-robin key pool with cooldown
-├── ProxyMiddleware.cs      # Core proxy logic (forwarding, retries, error handling)
-├── ElevenLabsProxy.csproj  # .NET 8 project file
-├── Dockerfile              # Multi-stage build (SDK → Alpine runtime)
-├── docker-compose.yml      # Container orchestration
-├── keys.txt                # ElevenLabs API keys (one per line)
-├── .env.example            # Configuration template
+├── Program.cs                    # Entry point, config loading, middleware pipeline
+├── ProxySettings.cs              # Configuration model
+├── KeyPool.cs                    # Thread-safe round-robin key pool with cooldown
+├── ProxyMiddleware.cs            # HTTP proxy (forwarding, retries, streaming responses)
+├── WebSocketProxyMiddleware.cs   # WebSocket proxy (bidirectional frame relay)
+├── ElevenLabsProxy.csproj        # .NET 8 project file
+├── Dockerfile                    # Multi-stage build (SDK -> Alpine runtime)
+├── docker-compose.yml            # Container orchestration
+├── keys.txt                      # ElevenLabs API keys (one per line)
+├── .env.example                  # Configuration template
 ├── .dockerignore
 └── .gitignore
 ```

@@ -11,6 +11,13 @@
 //      - 2xx → stream the response body back to the client
 //   4. Strips internal headers (concurrency counters, xi-api-key) from
 //      the response so pool details are not leaked to clients.
+//
+// Streaming support:
+//   - Response: chunked / audio / SSE responses are forwarded chunk-by-chunk
+//     with immediate flush, so the client receives data in real-time.
+//   - Request: the body is buffered once into memory to allow replaying on
+//     retries (429 key rotation, 500/503 retries). This is fine for typical
+//     ElevenLabs payloads (JSON text, usually < 100KB).
 // ============================================================================
 
 using System.Net;
@@ -236,14 +243,35 @@ public class ProxyMiddleware
 
     /// <summary>
     /// Copy upstream response status, headers, and body to the client.
-    /// The body is streamed (not buffered) so large audio files don't
-    /// consume excessive memory.
+    /// The body is streamed chunk-by-chunk (not buffered) so:
+    ///   - Large audio files don't consume excessive memory
+    ///   - Chunked/SSE streaming responses (e.g. streaming TTS) are forwarded
+    ///     in real-time — each chunk is flushed to the client immediately
     /// </summary>
     private static async Task ForwardResponse(HttpResponseMessage upstream, HttpResponse client)
     {
         client.StatusCode = (int)upstream.StatusCode;
 
-        // Copy response headers, excluding hop-by-hop and internal ones
+        // ── Detect streaming response ──────────────────────────────────
+        // ElevenLabs uses chunked transfer encoding for streaming TTS.
+        // We check both Transfer-Encoding and Content-Type to identify streams.
+        var isChunked = upstream.Headers.TransferEncodingChunked == true;
+        var contentType = upstream.Content.Headers.ContentType?.MediaType ?? "";
+        var isStreaming = isChunked
+            || contentType.Contains("text/event-stream")      // SSE
+            || contentType.Contains("application/octet-stream") // raw binary stream
+            || contentType.Contains("audio/");                  // streaming audio
+
+        // ── Disable response buffering for streaming ───────────────────
+        // Tell Kestrel not to buffer the response body — flush immediately.
+        if (isStreaming)
+        {
+            var bufferingFeature = client.HttpContext.Features
+                .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+            bufferingFeature?.DisableBuffering();
+        }
+
+        // ── Copy response headers ──────────────────────────────────────
         foreach (var header in upstream.Headers)
         {
             if (HopByHopHeaders.Contains(header.Key)) continue;
@@ -256,15 +284,40 @@ public class ProxyMiddleware
             client.Headers[header.Key] = header.Value.ToArray();
         }
 
-        // Copy content headers (e.g. Content-Type: audio/mpeg)
+        // Copy content headers (e.g. Content-Type: audio/mpeg, Content-Length, etc.)
         foreach (var header in upstream.Content.Headers)
         {
+            // Skip Transfer-Encoding — Kestrel manages its own chunked encoding
             if (header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase)) continue;
+            // Skip Content-Length for chunked responses — the proxy streams
+            // without knowing the total size, so a fixed Content-Length would be wrong
+            if (isChunked && header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
+
             client.Headers[header.Key] = header.Value.ToArray();
         }
 
-        // Stream the response body directly to the client without buffering
+        // ── Stream the body ────────────────────────────────────────────
         await using var upstreamStream = await upstream.Content.ReadAsStreamAsync();
-        await upstreamStream.CopyToAsync(client.Body);
+
+        if (isStreaming)
+        {
+            // Streaming mode: read in small chunks and flush each one immediately.
+            // This ensures the client receives audio/SSE data in real-time
+            // rather than waiting for the entire response to complete.
+            var buffer = new byte[8192]; // 8KB chunks — good balance between
+                                         // syscall overhead and latency
+            int bytesRead;
+            while ((bytesRead = await upstreamStream.ReadAsync(buffer)) > 0)
+            {
+                await client.Body.WriteAsync(buffer.AsMemory(0, bytesRead));
+                await client.Body.FlushAsync(); // push each chunk to the wire immediately
+            }
+        }
+        else
+        {
+            // Non-streaming: copy the entire body at once (more efficient for
+            // small JSON responses where latency per-chunk doesn't matter)
+            await upstreamStream.CopyToAsync(client.Body);
+        }
     }
 }
