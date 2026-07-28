@@ -3,31 +3,21 @@
 //
 // This middleware handles every authenticated request:
 //   1. Reads the client's request body into memory (needed for retries)
-//   2. Acquires a key from the pool and builds an upstream request
+//   2. Acquires a key from the pool (with concurrency slot)
 //   3. Sends it to ElevenLabs and inspects the status code:
-//      - 429 → cooldown this key, try the next one from the pool
-//      - 500/503 → wait RETRY_DELAY_MS, retry up to RETRY_COUNT times
-//      - 4xx → return to client immediately (client's fault, no retry)
-//      - 2xx → stream the response body back to the client
-//   4. Strips internal headers (concurrency counters, xi-api-key) from
-//      the response so pool details are not leaked to clients.
-//
-// Streaming support:
-//   - Response: chunked / audio / SSE responses are forwarded chunk-by-chunk
-//     with immediate flush, so the client receives data in real-time.
-//   - Request: the body is buffered once into memory to allow replaying on
-//     retries (429 key rotation, 500/503 retries). This is fine for typical
-//     ElevenLabs payloads (JSON text, usually < 100KB).
+//      - 429 → cooldown this key, release slot, try next key
+//      - 401 detected_unusual_activity → disable key permanently
+//      - 401/402 quota_exceeded → send key to back, try next
+//      - 500/503 → retry up to RetryCount per key, then next key
+//      - 4xx → return to client immediately
+//      - 2xx → stream response, then release slot
+//   4. Release() is always called via try/finally to free concurrency slots
 // ============================================================================
 
 using System.Net;
 
 namespace ElevenLabsProxy;
 
-/// <summary>
-/// ASP.NET Core middleware that transparently proxies requests to the
-/// ElevenLabs API with automatic key rotation and error handling.
-/// </summary>
 public class ProxyMiddleware
 {
     private readonly KeyPool _keyPool;
@@ -35,10 +25,6 @@ public class ProxyMiddleware
     private readonly HttpClient _httpClient;
     private readonly ILogger<ProxyMiddleware> _logger;
 
-    /// <summary>
-    /// HTTP hop-by-hop headers that must NOT be forwarded between client ↔ proxy ↔ upstream.
-    /// See RFC 2616 §13.5.1.
-    /// </summary>
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
         "Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
@@ -46,7 +32,7 @@ public class ProxyMiddleware
     };
 
     public ProxyMiddleware(
-        RequestDelegate _,          // unused — this is a terminal middleware
+        RequestDelegate _,
         KeyPool keyPool,
         ProxySettings settings,
         IHttpClientFactory httpClientFactory,
@@ -63,270 +49,274 @@ public class ProxyMiddleware
         var request = context.Request;
         var response = context.Response;
 
-        // ── Buffer the request body ────────────────────────────────────
-        // We need to replay it on retries, so read it fully into memory once.
+        // Buffer the request body once — needed for retries
         using var bodyStream = new MemoryStream();
         await request.Body.CopyToAsync(bodyStream);
         var bodyBytes = bodyStream.ToArray();
 
-        // Track which keys have already been tried (for 429/402 rotation)
         var triedKeys = new HashSet<string>();
-        HttpResponseMessage? lastUpstreamResponse = null;
-
-        // Per-key 500/503 retry counters — each key gets its own RetryCount budget
         var serverErrorsByKey = new Dictionary<string, int>();
-
-        // Max iterations = all keys × retries per key — absolute ceiling to prevent infinite loops
         var maxAttempts = _keyPool.Size * (_settings.RetryCount + 1);
+        string? lastRateLimitBody = null;
+        string? lastErrorBody = null;
+        int lastErrorStatus = 429;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            // ── Acquire a key from the pool ────────────────────────────
+            // ── Acquire a key (with concurrency slot) ──────────────────
             var apiKey = _keyPool.Acquire(out var retryAfterMs);
 
-            // All keys are on cooldown — tell the client to retry later
             if (apiKey == null)
             {
-                response.StatusCode = 429;
-                response.ContentType = "application/json";
-                await response.WriteAsJsonAsync(new
+                // No key available — return last real error or generic 429
+                if (lastRateLimitBody != null)
                 {
-                    error = "all_keys_rate_limited",
-                    message = "All API keys are currently rate-limited. Please retry later.",
-                    retry_after_ms = retryAfterMs
-                });
+                    response.StatusCode = 429;
+                    response.ContentType = "application/json";
+                    await response.WriteAsync(lastRateLimitBody);
+                }
+                else if (lastErrorBody != null)
+                {
+                    response.StatusCode = lastErrorStatus;
+                    response.ContentType = "application/json";
+                    await response.WriteAsync(lastErrorBody);
+                }
+                else
+                {
+                    response.StatusCode = 429;
+                    response.ContentType = "application/json";
+                    await response.WriteAsJsonAsync(new
+                    {
+                        detail = new
+                        {
+                            type = "rate_limit_error",
+                            code = "rate_limit_exceeded",
+                            message = "Too many requests. Please retry later.",
+                            status = "rate_limit_exceeded"
+                        }
+                    });
+                }
                 return;
             }
 
-            // ── Build the upstream request ─────────────────────────────
-            var targetUrl = $"{_settings.ElevenLabsBaseUrl.TrimEnd('/')}{request.Path}{request.QueryString}";
-            using var upstreamRequest = new HttpRequestMessage(new HttpMethod(request.Method), targetUrl);
-
-            // Forward all client headers except hop-by-hop and the proxy's xi-api-key
-            foreach (var header in request.Headers)
-            {
-                if (HopByHopHeaders.Contains(header.Key)) continue;
-                if (header.Key.Equals("xi-api-key", StringComparison.OrdinalIgnoreCase)) continue;
-
-                // TryAddWithoutValidation returns false for content-specific headers
-                // (e.g. Content-Type) — those are set on the content object below
-                if (!upstreamRequest.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()))
-                {
-                    // Will be set on HttpContent below
-                }
-            }
-
-            // Inject the real ElevenLabs API key from the pool
-            upstreamRequest.Headers.Remove("xi-api-key");
-            upstreamRequest.Headers.TryAddWithoutValidation("xi-api-key", apiKey);
-
-            // Attach the request body for non-GET/HEAD methods
-            if (request.Method != "GET" && request.Method != "HEAD" && bodyBytes.Length > 0)
-            {
-                var content = new ByteArrayContent(bodyBytes);
-
-                if (request.ContentType != null)
-                {
-                    content.Headers.Remove("Content-Type");
-                    content.Headers.TryAddWithoutValidation("Content-Type", request.ContentType);
-                }
-
-                upstreamRequest.Content = content;
-            }
-
-            // ── Send the request upstream ──────────────────────────────
-            HttpResponseMessage upstreamResponse;
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_settings.RequestTimeoutSeconds));
+                // ── Build upstream request ─────────────────────────────
+                var targetUrl = $"{_settings.ElevenLabsBaseUrl.TrimEnd('/')}{request.Path}{request.QueryString}";
+                using var upstreamRequest = new HttpRequestMessage(new HttpMethod(request.Method), targetUrl);
 
-                // ResponseHeadersRead: start processing as soon as headers arrive,
-                // don't wait for the full body (important for streaming audio)
-                upstreamResponse = await _httpClient.SendAsync(
-                    upstreamRequest,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cts.Token);
-            }
-            catch (Exception ex)
-            {
-                serverErrorsByKey.TryGetValue(apiKey, out var keyErrors);
-                keyErrors++;
-                serverErrorsByKey[apiKey] = keyErrors;
-
-                _logger.LogError(ex, "Upstream request failed, key ...{KeySuffix} attempt {Attempt}/{Max}",
-                    apiKey[^6..], keyErrors, _settings.RetryCount);
-
-                // This key exhausted its retry budget — try next key
-                if (keyErrors >= _settings.RetryCount)
+                foreach (var header in request.Headers)
                 {
-                    triedKeys.Add(apiKey);
-                    if (triedKeys.Count < _keyPool.Size)
+                    if (HopByHopHeaders.Contains(header.Key)) continue;
+                    if (header.Key.Equals("xi-api-key", StringComparison.OrdinalIgnoreCase)) continue;
+                    upstreamRequest.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+                }
+
+                upstreamRequest.Headers.Remove("xi-api-key");
+                upstreamRequest.Headers.TryAddWithoutValidation("xi-api-key", apiKey);
+
+                if (request.Method != "GET" && request.Method != "HEAD" && bodyBytes.Length > 0)
+                {
+                    var content = new ByteArrayContent(bodyBytes);
+                    if (request.ContentType != null)
                     {
-                        continue;
+                        content.Headers.Remove("Content-Type");
+                        content.Headers.TryAddWithoutValidation("Content-Type", request.ContentType);
                     }
-                    // All keys exhausted
-                    response.StatusCode = 502;
-                    response.ContentType = "application/json";
-                    await response.WriteAsJsonAsync(new
+                    upstreamRequest.Content = content;
+                }
+
+                // ── Send upstream ──────────────────────────────────────
+                HttpResponseMessage upstreamResponse;
+                try
+                {
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_settings.RequestTimeoutSeconds));
+                    upstreamResponse = await _httpClient.SendAsync(
+                        upstreamRequest,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        cts.Token);
+                }
+                catch (Exception ex)
+                {
+                    _keyPool.Release(apiKey);
+
+                    serverErrorsByKey.TryGetValue(apiKey, out var errs);
+                    errs++;
+                    serverErrorsByKey[apiKey] = errs;
+
+                    _logger.LogError(ex, "Upstream request failed, key ...{KeySuffix} attempt {Attempt}/{Max}",
+                        apiKey[^6..], errs, _settings.RetryCount);
+
+                    if (errs >= _settings.RetryCount)
                     {
-                        error = "proxy_error",
-                        message = $"Failed to reach ElevenLabs: {ex.Message}"
-                    });
+                        triedKeys.Add(apiKey);
+                        if (triedKeys.Count >= _keyPool.Size)
+                        {
+                            response.StatusCode = 502;
+                            response.ContentType = "application/json";
+                            await response.WriteAsJsonAsync(new
+                            {
+                                detail = new
+                                {
+                                    type = "internal_error",
+                                    code = "internal_error",
+                                    message = $"Failed to reach ElevenLabs: {ex.Message}",
+                                    status = "internal_error"
+                                }
+                            });
+                            return;
+                        }
+                    }
+
+                    await Task.Delay(_settings.RetryDelayMs);
+                    continue;
+                }
+
+                var statusCode = (int)upstreamResponse.StatusCode;
+
+                // ── 429: rate limited ──────────────────────────────────
+                if (statusCode == 429)
+                {
+                    int? retryAfter = null;
+                    if (upstreamResponse.Headers.TryGetValues("Retry-After", out var raValues))
+                    {
+                        if (double.TryParse(raValues.FirstOrDefault(), out var raSec))
+                            retryAfter = (int)(raSec * 1000);
+                    }
+
+                    lastRateLimitBody = await upstreamResponse.Content.ReadAsStringAsync();
+                    upstreamResponse.Dispose();
+
+                    _keyPool.Release(apiKey);
+                    _keyPool.MarkRateLimited(apiKey, retryAfter, _settings.KeyCooldownMs);
+                    triedKeys.Add(apiKey);
+
+                    if (triedKeys.Count < _keyPool.Size) continue;
+
+                    // All keys exhausted — forward last 429 from ElevenLabs
+                    response.StatusCode = 429;
+                    response.ContentType = "application/json";
+                    await response.WriteAsync(lastRateLimitBody);
                     return;
                 }
 
-                await Task.Delay(_settings.RetryDelayMs);
-                continue;
-            }
-
-            lastUpstreamResponse = upstreamResponse;
-            var statusCode = (int)upstreamResponse.StatusCode;
-
-            // ── 429: rate limited → cooldown this key, rotate to next ──
-            if (statusCode == 429)
-            {
-                // Parse the Retry-After header if present (value is in seconds)
-                int? retryAfter = null;
-                if (upstreamResponse.Headers.TryGetValues("Retry-After", out var raValues))
+                // ── 401/402: check for quota or ban ───────────────────
+                if (statusCode is 401 or 402)
                 {
-                    if (double.TryParse(raValues.FirstOrDefault(), out var raSec))
-                        retryAfter = (int)(raSec * 1000); // convert to ms
+                    var errorBody = await upstreamResponse.Content.ReadAsStringAsync();
+                    lastErrorBody = errorBody;
+                    lastErrorStatus = statusCode;
+
+                    // detected_unusual_activity → disable key permanently
+                    if (errorBody.Contains("detected_unusual_activity", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogWarning("Key ...{KeySuffix} BANNED (detected_unusual_activity), disabling",
+                            apiKey[^6..]);
+
+                        _keyPool.Release(apiKey);
+                        _keyPool.Disable(apiKey);
+                        triedKeys.Add(apiKey);
+
+                        if (triedKeys.Count < _keyPool.Size) continue;
+
+                        await ForwardResponseFromBytes(upstreamResponse, errorBody, response);
+                        return;
+                    }
+
+                    // quota_exceeded → cooldown + send to back, try next key
+                    if (errorBody.Contains("quota_exceeded", StringComparison.OrdinalIgnoreCase)
+                        || errorBody.Contains("insufficient_credits", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogWarning("Key ...{KeySuffix} quota exceeded, cooldown {Cooldown}ms, trying next key",
+                            apiKey[^6..], _settings.QuotaCooldownMs);
+
+                        _keyPool.Release(apiKey);
+                        _keyPool.MarkRateLimited(apiKey, _settings.QuotaCooldownMs, _settings.QuotaCooldownMs);
+                        _keyPool.SendToBack(apiKey);
+                        triedKeys.Add(apiKey);
+                        upstreamResponse.Dispose();
+
+                        if (triedKeys.Count < _keyPool.Size) continue;
+
+                        await ForwardResponseFromBytes(upstreamResponse, errorBody, response);
+                        return;
+                    }
+
+                    // Real auth error — forward as-is
+                    _keyPool.Release(apiKey);
+                    await ForwardResponseFromBytes(upstreamResponse, errorBody, response);
+                    return;
                 }
 
-                _keyPool.MarkRateLimited(apiKey, retryAfter, _settings.KeyCooldownMs);
-                triedKeys.Add(apiKey);
-
-                // Must drain the body before disposing to allow connection reuse
-                await upstreamResponse.Content.ReadAsByteArrayAsync();
-                upstreamResponse.Dispose();
-
-                // Still have untried keys — immediately try the next one
-                if (triedKeys.Count < _keyPool.Size)
+                // ── Other 4xx: client error, no retry ─────────────────
+                if (statusCode >= 400 && statusCode < 500)
                 {
+                    _keyPool.Release(apiKey);
+                    await ForwardResponse(upstreamResponse, response);
+                    return;
+                }
+
+                // ── 500/503: server error, retry per key ──────────────
+                if (statusCode is 500 or 503)
+                {
+                    serverErrorsByKey.TryGetValue(apiKey, out var keyErrors);
+                    keyErrors++;
+                    serverErrorsByKey[apiKey] = keyErrors;
+
+                    _logger.LogWarning("Upstream returned {Status}, key ...{KeySuffix} attempt {Attempt}/{Max}",
+                        statusCode, apiKey[^6..], keyErrors, _settings.RetryCount);
+
+                    lastErrorBody = await upstreamResponse.Content.ReadAsStringAsync();
+                    lastErrorStatus = statusCode;
+                    upstreamResponse.Dispose();
+
+                    _keyPool.Release(apiKey);
+
+                    if (keyErrors >= _settings.RetryCount)
+                    {
+                        triedKeys.Add(apiKey);
+                        if (triedKeys.Count >= _keyPool.Size)
+                        {
+                            response.StatusCode = statusCode;
+                            response.ContentType = "application/json";
+                            await response.WriteAsync(lastErrorBody);
+                            return;
+                        }
+                    }
+
+                    await Task.Delay(_settings.RetryDelayMs);
                     continue;
                 }
 
-                // All keys exhausted — tell the client
-                response.StatusCode = 429;
-                response.ContentType = "application/json";
-                await response.WriteAsJsonAsync(new
-                {
-                    error = "all_keys_rate_limited",
-                    message = "All API keys are rate-limited."
-                });
-                return;
-            }
-
-            // ── 402: quota exceeded → rotate to next key, no cooldown ──
-            // The key may still have credits, just not enough for THIS request.
-            // E.g. 318 credits remaining but the request needs 486.
-            // Move the key to the back of the round-robin queue (no cooldown)
-            // so smaller requests can still use it.
-            if (statusCode == 402)
-            {
-                _logger.LogWarning("Key ...{KeySuffix} returned 402 (quota exceeded for this request), trying next key",
-                    apiKey[^6..]);
-
-                // Move this key to the end of the pool — it still works for
-                // smaller requests, but shouldn't block the queue
-                _keyPool.SendToBack(apiKey);
-                triedKeys.Add(apiKey);
-
-                // Drain body before dispose
-                await upstreamResponse.Content.ReadAsByteArrayAsync();
-                upstreamResponse.Dispose();
-
-                // Still have untried keys — try the next one immediately
-                if (triedKeys.Count < _keyPool.Size)
-                {
-                    continue;
-                }
-
-                // All keys returned 402 — forward the original error to the client
-                response.StatusCode = 402;
-                response.ContentType = "application/json";
-                await response.WriteAsJsonAsync(new
-                {
-                    error = "all_keys_quota_exceeded",
-                    message = "All API keys have insufficient credits for this request."
-                });
-                return;
-            }
-
-            // ── 4xx: client error → return immediately, no retry ───────
-            // These are the client's fault (bad request, auth error, etc.)
-            if (statusCode >= 400 && statusCode < 500)
-            {
+                // ── 2xx: success → stream to client, then release ─────
                 await ForwardResponse(upstreamResponse, response);
+                _keyPool.Release(apiKey);
                 return;
             }
-
-            // ── 500 / 503: server error → retry with per-key budget ─────
-            if (statusCode is 500 or 503)
+            catch
             {
-                serverErrorsByKey.TryGetValue(apiKey, out var keyErrors);
-                keyErrors++;
-                serverErrorsByKey[apiKey] = keyErrors;
-
-                _logger.LogWarning("Upstream returned {Status}, key ...{KeySuffix} attempt {Attempt}/{Max}",
-                    statusCode, apiKey[^6..], keyErrors, _settings.RetryCount);
-
-                // Drain body before dispose so the connection can be reused
-                await upstreamResponse.Content.ReadAsByteArrayAsync();
-                upstreamResponse.Dispose();
-
-                // This key exhausted its retry budget — move to next key
-                if (keyErrors >= _settings.RetryCount)
-                {
-                    triedKeys.Add(apiKey);
-                    if (triedKeys.Count < _keyPool.Size)
-                    {
-                        continue; // try next key immediately
-                    }
-                    // All keys exhausted their retries
-                    response.StatusCode = statusCode;
-                    response.ContentType = "application/json";
-                    await response.WriteAsJsonAsync(new
-                    {
-                        error = "upstream_error",
-                        message = $"ElevenLabs returned {statusCode} after trying all keys ({_settings.RetryCount} retries each)."
-                    });
-                    return;
-                }
-
-                await Task.Delay(_settings.RetryDelayMs);
-                continue;
+                // Safety net: always release the concurrency slot
+                _keyPool.Release(apiKey);
+                throw;
             }
-
-            // ── 2xx / other success → stream back to client ────────────
-            await ForwardResponse(upstreamResponse, response);
-            return;
         }
     }
 
     /// <summary>
-    /// Copy upstream response status, headers, and body to the client.
-    /// The body is streamed chunk-by-chunk (not buffered) so:
-    ///   - Large audio files don't consume excessive memory
-    ///   - Chunked/SSE streaming responses (e.g. streaming TTS) are forwarded
-    ///     in real-time — each chunk is flushed to the client immediately
+    /// Stream upstream response to client chunk-by-chunk with immediate flush
+    /// for streaming responses (audio, SSE).
     /// </summary>
     private static async Task ForwardResponse(HttpResponseMessage upstream, HttpResponse client)
     {
         client.StatusCode = (int)upstream.StatusCode;
 
-        // ── Detect streaming response ──────────────────────────────────
-        // ElevenLabs uses chunked transfer encoding for streaming TTS.
-        // We check both Transfer-Encoding and Content-Type to identify streams.
         var isChunked = upstream.Headers.TransferEncodingChunked == true;
         var contentType = upstream.Content.Headers.ContentType?.MediaType ?? "";
         var isStreaming = isChunked
-            || contentType.Contains("text/event-stream")      // SSE
-            || contentType.Contains("application/octet-stream") // raw binary stream
-            || contentType.Contains("audio/");                  // streaming audio
+            || contentType.Contains("text/event-stream")
+            || contentType.Contains("application/octet-stream")
+            || contentType.Contains("audio/");
 
-        // ── Disable response buffering for streaming ───────────────────
-        // Tell Kestrel not to buffer the response body — flush immediately.
         if (isStreaming)
         {
             var bufferingFeature = client.HttpContext.Features
@@ -334,53 +324,61 @@ public class ProxyMiddleware
             bufferingFeature?.DisableBuffering();
         }
 
-        // ── Copy response headers ──────────────────────────────────────
         foreach (var header in upstream.Headers)
         {
             if (HopByHopHeaders.Contains(header.Key)) continue;
             if (header.Key.Equals("xi-api-key", StringComparison.OrdinalIgnoreCase)) continue;
-
-            // Strip ElevenLabs concurrency headers — they reveal pool internals
             if (header.Key.Equals("current-concurrent-requests", StringComparison.OrdinalIgnoreCase)) continue;
             if (header.Key.Equals("maximum-concurrent-requests", StringComparison.OrdinalIgnoreCase)) continue;
-
             client.Headers[header.Key] = header.Value.ToArray();
         }
 
-        // Copy content headers (e.g. Content-Type: audio/mpeg, Content-Length, etc.)
         foreach (var header in upstream.Content.Headers)
         {
-            // Skip Transfer-Encoding — Kestrel manages its own chunked encoding
             if (header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase)) continue;
-            // Skip Content-Length for chunked responses — the proxy streams
-            // without knowing the total size, so a fixed Content-Length would be wrong
             if (isChunked && header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
-
             client.Headers[header.Key] = header.Value.ToArray();
         }
 
-        // ── Stream the body ────────────────────────────────────────────
         await using var upstreamStream = await upstream.Content.ReadAsStreamAsync();
 
         if (isStreaming)
         {
-            // Streaming mode: read in small chunks and flush each one immediately.
-            // This ensures the client receives audio/SSE data in real-time
-            // rather than waiting for the entire response to complete.
-            var buffer = new byte[8192]; // 8KB chunks — good balance between
-                                         // syscall overhead and latency
+            var buffer = new byte[8192];
             int bytesRead;
             while ((bytesRead = await upstreamStream.ReadAsync(buffer)) > 0)
             {
                 await client.Body.WriteAsync(buffer.AsMemory(0, bytesRead));
-                await client.Body.FlushAsync(); // push each chunk to the wire immediately
+                await client.Body.FlushAsync();
             }
         }
         else
         {
-            // Non-streaming: copy the entire body at once (more efficient for
-            // small JSON responses where latency per-chunk doesn't matter)
             await upstreamStream.CopyToAsync(client.Body);
         }
+    }
+
+    /// <summary>
+    /// Forward a response when the body has already been read as a string.
+    /// </summary>
+    private static async Task ForwardResponseFromBytes(
+        HttpResponseMessage upstream, string body, HttpResponse client)
+    {
+        client.StatusCode = (int)upstream.StatusCode;
+
+        foreach (var header in upstream.Headers)
+        {
+            if (HopByHopHeaders.Contains(header.Key)) continue;
+            if (header.Key.Equals("xi-api-key", StringComparison.OrdinalIgnoreCase)) continue;
+            client.Headers[header.Key] = header.Value.ToArray();
+        }
+
+        foreach (var header in upstream.Content.Headers)
+        {
+            if (header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase)) continue;
+            client.Headers[header.Key] = header.Value.ToArray();
+        }
+
+        await client.WriteAsync(body);
     }
 }

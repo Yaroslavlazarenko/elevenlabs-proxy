@@ -51,4 +51,17 @@ public class ProxySettings
     /// TTS generation can take a while for long texts, so the default is generous.
     /// </summary>
     public int RequestTimeoutSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// Maximum concurrent requests per API key. ElevenLabs Free Tier allows 4.
+    /// When a key hits this limit, the proxy uses the next key with available
+    /// slots, spreading load across keys and preventing concurrency 429s.
+    /// </summary>
+    public int MaxConcurrentPerKey { get; set; } = 4;
+
+    /// <summary>
+    /// Cooldown in milliseconds for a key that returned quota_exceeded.
+    /// Prevents hammering a key with depleted credits. Default: 5 minutes.
+    /// </summary>
+    public int QuotaCooldownMs { get; set; } = 300_000;
 }

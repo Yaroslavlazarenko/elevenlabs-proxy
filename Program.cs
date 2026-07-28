@@ -23,6 +23,8 @@ var settings = new ProxySettings
     RetryDelayMs = int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_MS"), out var rd) ? rd : 1000,
     KeyCooldownMs = int.TryParse(Environment.GetEnvironmentVariable("KEY_COOLDOWN_MS"), out var kc) ? kc : 60_000,
     RequestTimeoutSeconds = int.TryParse(Environment.GetEnvironmentVariable("REQUEST_TIMEOUT_SECONDS"), out var rt) ? rt : 120,
+    MaxConcurrentPerKey = int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_PER_KEY"), out var mc) ? mc : 4,
+    QuotaCooldownMs = int.TryParse(Environment.GetEnvironmentVariable("QUOTA_COOLDOWN_MS"), out var qc) ? qc : 300_000,
 };
 
 // ── Load ElevenLabs API keys ───────────────────────────────────────────
@@ -63,8 +65,8 @@ if (string.IsNullOrWhiteSpace(settings.ProxyApiKey))
 }
 
 // ── Initialize key pool ────────────────────────────────────────────────
-var keyPool = new KeyPool(settings.ElevenLabsApiKeys);
-Console.WriteLine($"[server] Loaded {keyPool.Size} ElevenLabs API key(s)");
+var keyPool = new KeyPool(settings.ElevenLabsApiKeys, settings.MaxConcurrentPerKey);
+Console.WriteLine($"[server] Loaded {keyPool.Size} ElevenLabs API key(s), max {settings.MaxConcurrentPerKey} concurrent per key");
 
 // ── Register services in DI container ──────────────────────────────────
 builder.Services.AddSingleton(settings);
