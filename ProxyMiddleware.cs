@@ -69,11 +69,17 @@ public class ProxyMiddleware
         await request.Body.CopyToAsync(bodyStream);
         var bodyBytes = bodyStream.ToArray();
 
-        // Track which keys have already been tried (for 429 rotation)
+        // Track which keys have already been tried (for 429/402 rotation)
         var triedKeys = new HashSet<string>();
         HttpResponseMessage? lastUpstreamResponse = null;
 
-        for (int attempt = 0; attempt < _settings.RetryCount; attempt++)
+        // Per-key 500/503 retry counters — each key gets its own RetryCount budget
+        var serverErrorsByKey = new Dictionary<string, int>();
+
+        // Max iterations = all keys × retries per key — absolute ceiling to prevent infinite loops
+        var maxAttempts = _keyPool.Size * (_settings.RetryCount + 1);
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
             // ── Acquire a key from the pool ────────────────────────────
             var apiKey = _keyPool.Acquire(out var retryAfterMs);
@@ -143,11 +149,22 @@ public class ProxyMiddleware
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Upstream request failed (attempt {Attempt}/{Max})", attempt + 1, _settings.RetryCount);
+                serverErrorsByKey.TryGetValue(apiKey, out var keyErrors);
+                keyErrors++;
+                serverErrorsByKey[apiKey] = keyErrors;
 
-                // Out of retries — report a gateway error
-                if (attempt + 1 >= _settings.RetryCount)
+                _logger.LogError(ex, "Upstream request failed, key ...{KeySuffix} attempt {Attempt}/{Max}",
+                    apiKey[^6..], keyErrors, _settings.RetryCount);
+
+                // This key exhausted its retry budget — try next key
+                if (keyErrors >= _settings.RetryCount)
                 {
+                    triedKeys.Add(apiKey);
+                    if (triedKeys.Count < _keyPool.Size)
+                    {
+                        continue;
+                    }
+                    // All keys exhausted
                     response.StatusCode = 502;
                     response.ContentType = "application/json";
                     await response.WriteAsJsonAsync(new
@@ -200,6 +217,39 @@ public class ProxyMiddleware
                 return;
             }
 
+            // ── 402: quota exceeded → rotate to next key, no cooldown ──
+            // The key may still have credits, just not enough for THIS request.
+            // E.g. 318 credits remaining but the request needs 486.
+            // Move the key to the back of the round-robin queue (no cooldown)
+            // so smaller requests can still use it.
+            if (statusCode == 402)
+            {
+                _logger.LogWarning("Key ...{KeySuffix} returned 402 (quota exceeded for this request), trying next key",
+                    apiKey[^6..]);
+
+                triedKeys.Add(apiKey);
+
+                // Drain body before dispose
+                await upstreamResponse.Content.ReadAsByteArrayAsync();
+                upstreamResponse.Dispose();
+
+                // Still have untried keys — try the next one immediately
+                if (triedKeys.Count < _keyPool.Size)
+                {
+                    continue;
+                }
+
+                // All keys returned 402 — forward the original error to the client
+                response.StatusCode = 402;
+                response.ContentType = "application/json";
+                await response.WriteAsJsonAsync(new
+                {
+                    error = "all_keys_quota_exceeded",
+                    message = "All API keys have insufficient credits for this request."
+                });
+                return;
+            }
+
             // ── 4xx: client error → return immediately, no retry ───────
             // These are the client's fault (bad request, auth error, etc.)
             if (statusCode >= 400 && statusCode < 500)
@@ -208,25 +258,35 @@ public class ProxyMiddleware
                 return;
             }
 
-            // ── 500 / 503: server error → retry after delay ────────────
+            // ── 500 / 503: server error → retry with per-key budget ─────
             if (statusCode is 500 or 503)
             {
-                _logger.LogWarning("Upstream returned {Status}, attempt {Attempt}/{Max}",
-                    statusCode, attempt + 1, _settings.RetryCount);
+                serverErrorsByKey.TryGetValue(apiKey, out var keyErrors);
+                keyErrors++;
+                serverErrorsByKey[apiKey] = keyErrors;
+
+                _logger.LogWarning("Upstream returned {Status}, key ...{KeySuffix} attempt {Attempt}/{Max}",
+                    statusCode, apiKey[^6..], keyErrors, _settings.RetryCount);
 
                 // Drain body before dispose so the connection can be reused
                 await upstreamResponse.Content.ReadAsByteArrayAsync();
                 upstreamResponse.Dispose();
 
-                // Out of retries — forward the last error status
-                if (attempt + 1 >= _settings.RetryCount)
+                // This key exhausted its retry budget — move to next key
+                if (keyErrors >= _settings.RetryCount)
                 {
+                    triedKeys.Add(apiKey);
+                    if (triedKeys.Count < _keyPool.Size)
+                    {
+                        continue; // try next key immediately
+                    }
+                    // All keys exhausted their retries
                     response.StatusCode = statusCode;
                     response.ContentType = "application/json";
                     await response.WriteAsJsonAsync(new
                     {
                         error = "upstream_error",
-                        message = $"ElevenLabs returned {statusCode} after {_settings.RetryCount} retries."
+                        message = $"ElevenLabs returned {statusCode} after trying all keys ({_settings.RetryCount} retries each)."
                     });
                     return;
                 }
