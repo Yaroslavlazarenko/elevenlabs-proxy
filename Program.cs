@@ -121,11 +121,12 @@ app.UseWhen(
     },
     proxyApp =>
     {
-        // Authentication gate: compare the client's xi-api-key header
+        // Authentication gate: compare the client's xi-api-key header or query param
         // against the configured PROXY_API_KEY. Reject with 401 on mismatch.
         proxyApp.Use(async (context, next) =>
         {
-            var clientKey = context.Request.Headers["xi-api-key"].FirstOrDefault();
+            var clientKey = context.Request.Headers["xi-api-key"].FirstOrDefault()
+                         ?? context.Request.Query["xi-api-key"].FirstOrDefault();
             if (string.IsNullOrEmpty(clientKey) || clientKey != settings.ProxyApiKey)
             {
                 context.Response.StatusCode = 401;
@@ -133,7 +134,7 @@ app.UseWhen(
                 await context.Response.WriteAsJsonAsync(new
                 {
                     error = "unauthorized",
-                    message = "Invalid or missing xi-api-key header."
+                    message = "Invalid or missing xi-api-key header or query parameter."
                 });
                 return;
             }
