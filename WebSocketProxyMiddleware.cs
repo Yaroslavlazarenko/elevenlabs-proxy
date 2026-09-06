@@ -1,22 +1,11 @@
 // ============================================================================
 // WebSocketProxyMiddleware.cs — WebSocket proxy for ElevenLabs real-time APIs
-//
-// ElevenLabs uses WebSocket connections for several real-time endpoints:
-//   - /v1/text-to-speech/{voice_id}/stream-input       — streaming TTS input
-//   - /v1/text-to-speech/{voice_id}/multi-stream-input — multi-context TTS
-//   - /v1/speech-to-text/realtime                       — real-time STT
-//
-// This middleware intercepts WebSocket upgrade requests, authenticates the
-// client via the xi-api-key header (or query param), replaces it with a real
-// key from the pool, opens a WebSocket to ElevenLabs upstream, and relays
-// frames bidirectionally (client ↔ upstream) until either side closes.
-//
-// Key rotation on 429 is NOT applicable here — WebSocket upgrades either
-// succeed or fail at connection time. If the upgrade fails, the middleware
-// returns the upstream error to the client.
+// With seamless hot-failover on quota_exceeded (STT/TTS stream survival)
 // ============================================================================
 
 using System.Net.WebSockets;
+using System.Text;
+using System.Threading.Channels;
 
 namespace ElevenLabsProxy;
 
@@ -27,8 +16,7 @@ public class WebSocketProxyMiddleware
     private readonly ProxySettings _settings;
     private readonly ILogger<WebSocketProxyMiddleware> _logger;
 
-    /// <summary>Buffer size for relaying WebSocket frames (4KB per direction).</summary>
-    private const int BufferSize = 4096;
+    private const int BufferSize = 8192;
 
     public WebSocketProxyMiddleware(
         RequestDelegate next,
@@ -42,9 +30,10 @@ public class WebSocketProxyMiddleware
         _logger = logger;
     }
 
+    private record QueuedFrame(byte[] Data, WebSocketMessageType MessageType, bool EndOfMessage);
+
     public async Task InvokeAsync(HttpContext context)
     {
-        // Only handle WebSocket upgrade requests
         if (!context.WebSockets.IsWebSocketRequest)
         {
             await _next(context);
@@ -53,46 +42,303 @@ public class WebSocketProxyMiddleware
 
         _logger.LogInformation("[ws-proxy] WebSocket upgrade for {Path}", context.Request.Path);
 
-        // ── Acquire a key from the pool ────────────────────────────────
-        var apiKey = _keyPool.Acquire(out var retryAfterMs);
-        if (apiKey == null)
+        // 1. Accept client WebSocket first so the client connection is stable
+        using var clientWs = await context.WebSockets.AcceptWebSocketAsync();
+
+        var upstreamUriTemplate = BuildUpstreamUri(context);
+
+        // 2. Acquire initial key and connect upstream
+        string? currentApiKey = null;
+        ClientWebSocket? currentUpstreamWs = null;
+
+        var triedKeys = new HashSet<string>();
+        while (currentUpstreamWs == null)
         {
-            context.Response.StatusCode = 429;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsJsonAsync(new
+            currentApiKey = _keyPool.Acquire(out var retryAfterMs);
+            if (currentApiKey == null || triedKeys.Count >= _keyPool.Size)
             {
-                error = "all_keys_rate_limited",
-                message = "All API keys are currently rate-limited.",
-                retry_after_ms = retryAfterMs
-            });
-            return;
+                _logger.LogWarning("[ws-proxy] All keys on cooldown or exhausted at initial connect");
+                await clientWs.CloseAsync(WebSocketCloseStatus.InternalServerError, "All API keys rate-limited or exhausted", CancellationToken.None);
+                return;
+            }
+
+            triedKeys.Add(currentApiKey);
+            currentUpstreamWs = await ConnectUpstreamAsync(currentApiKey, upstreamUriTemplate, context);
+            if (currentUpstreamWs == null)
+            {
+                _keyPool.SendToBack(currentApiKey);
+            }
         }
 
-        // ── Build upstream WebSocket URI ────────────────────────────────
-        // Convert base URL scheme: https → wss, http → ws
+        _logger.LogInformation("[ws-proxy] Upstream connected with key ...{Key}. Relaying frames with hot-failover support.", currentApiKey?[^6..] ?? "unknown");
+
+        // Channel for client -> upstream message queue (handles buffering during failover)
+        var clientChannel = Channel.CreateBounded<QueuedFrame>(new BoundedChannelOptions(150)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+
+        using var cts = new CancellationTokenSource();
+        var upstreamLock = new SemaphoreSlim(1, 1);
+
+        // Task 1: Client -> Channel reader
+        var clientReaderTask = Task.Run(async () =>
+        {
+            var buffer = new byte[BufferSize];
+            try
+            {
+                while (!cts.Token.IsCancellationRequested && clientWs.State == WebSocketState.Open)
+                {
+                    var result = await clientWs.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        _logger.LogDebug("[ws-proxy] Client sent close frame");
+                        break;
+                    }
+
+                    var frameData = new byte[result.Count];
+                    Array.Copy(buffer, frameData, result.Count);
+                    await clientChannel.Writer.WriteAsync(new QueuedFrame(frameData, result.MessageType, result.EndOfMessage), cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("[ws-proxy] Client reader exited: {Message}", ex.Message);
+            }
+            finally
+            {
+                clientChannel.Writer.TryComplete();
+                cts.Cancel();
+            }
+        });
+
+        // Task 2: Channel -> Upstream writer
+        var upstreamWriterTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var frame in clientChannel.Reader.ReadAllAsync(cts.Token))
+                {
+                    await upstreamLock.WaitAsync(cts.Token);
+                    try
+                    {
+                        if (currentUpstreamWs != null && currentUpstreamWs.State == WebSocketState.Open)
+                        {
+                            await currentUpstreamWs.SendAsync(
+                                new ArraySegment<byte>(frame.Data),
+                                frame.MessageType,
+                                frame.EndOfMessage,
+                                cts.Token
+                            );
+                        }
+                    }
+                    finally
+                    {
+                        upstreamLock.Release();
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("[ws-proxy] Upstream writer exited: {Message}", ex.Message);
+            }
+        });
+
+        // Task 3: Upstream -> Client reader with quota failover
+        var upstreamReaderTask = Task.Run(async () =>
+        {
+            var buffer = new byte[BufferSize];
+            var textMessageAccumulator = new MemoryStream();
+
+            try
+            {
+                while (!cts.Token.IsCancellationRequested && clientWs.State == WebSocketState.Open)
+                {
+                    if (currentUpstreamWs == null || currentUpstreamWs.State != WebSocketState.Open)
+                    {
+                        break;
+                    }
+
+                    WebSocketReceiveResult result;
+                    try
+                    {
+                        result = await currentUpstreamWs.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
+                    }
+                    catch (Exception ex) when (!cts.Token.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("[ws-proxy] Upstream receive error: {Message}", ex.Message);
+                        break;
+                    }
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        _logger.LogDebug("[ws-proxy] Upstream closed connection");
+                        break;
+                    }
+
+                    // Check for quota_exceeded in text frames
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        textMessageAccumulator.Write(buffer, 0, result.Count);
+
+                        if (result.EndOfMessage)
+                        {
+                            var text = Encoding.UTF8.GetString(textMessageAccumulator.ToArray());
+                            textMessageAccumulator.SetLength(0);
+
+                            if (text.Contains("quota_exceeded", StringComparison.OrdinalIgnoreCase) ||
+                                text.Contains("You have exceeded your quota", StringComparison.OrdinalIgnoreCase))
+                            {
+                                _logger.LogWarning("[ws-proxy] Upstream key ...{Key} quota exceeded mid-session! Initiating hot-failover...", currentApiKey?[^6..]);
+                                
+                                bool failedOver = false;
+                                await upstreamLock.WaitAsync(cts.Token);
+                                try
+                                {
+                                    if (currentApiKey != null)
+                                    {
+                                        _keyPool.SendToBack(currentApiKey);
+                                        _keyPool.MarkRateLimited(currentApiKey, defaultCooldownMs: 3600_000);
+                                    }
+
+                                    try { currentUpstreamWs.Dispose(); } catch { }
+                                    currentUpstreamWs = null;
+
+                                    // Try connecting with remaining keys
+                                    int failoverAttempts = 0;
+                                    while (failoverAttempts < _keyPool.Size)
+                                    {
+                                        failoverAttempts++;
+                                        var nextKey = _keyPool.Acquire(out _);
+                                        if (nextKey == null) break;
+
+                                        var newWs = await ConnectUpstreamAsync(nextKey, upstreamUriTemplate, context);
+                                        if (newWs != null)
+                                        {
+                                            currentApiKey = nextKey;
+                                            currentUpstreamWs = newWs;
+                                            failedOver = true;
+                                            _logger.LogInformation("[ws-proxy] Hot-failover SUCCESS! Switched to key ...{Key}", nextKey[^6..]);
+
+                                            // Consume initial session_started from new upstream silently
+                                            try
+                                            {
+                                                var initBuf = new byte[4096];
+                                                using var initCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                                                var initRes = await newWs.ReceiveAsync(new ArraySegment<byte>(initBuf), initCts.Token);
+                                                _logger.LogDebug("[ws-proxy] Suppressed duplicate session_started from failover upstream");
+                                            }
+                                            catch { }
+
+                                            break;
+                                        }
+                                        else
+                                        {
+                                            _keyPool.SendToBack(nextKey);
+                                        }
+                                    }
+                                }
+                                finally
+                                {
+                                    upstreamLock.Release();
+                                }
+
+                                if (failedOver)
+                                {
+                                    // Successfully switched to new upstream! Continue loop with new socket!
+                                    continue;
+                                }
+                                else
+                                {
+                                    _logger.LogError("[ws-proxy] Failover failed: no other working keys available. Forwarding error to client.");
+                                    var errBytes = Encoding.UTF8.GetBytes(text);
+                                    await clientWs.SendAsync(new ArraySegment<byte>(errBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                // Normal text message: forward full text to client
+                                var textBytes = Encoding.UTF8.GetBytes(text);
+                                await clientWs.SendAsync(new ArraySegment<byte>(textBytes), WebSocketMessageType.Text, true, cts.Token);
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            // Partial text chunk, wait for EndOfMessage
+                            continue;
+                        }
+                    }
+
+                    // Forward binary frames as-is
+                    await clientWs.SendAsync(new ArraySegment<byte>(buffer, 0, result.Count), result.MessageType, result.EndOfMessage, cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("[ws-proxy] Upstream reader exited: {Message}", ex.Message);
+            }
+            finally
+            {
+                cts.Cancel();
+            }
+        });
+
+        // Wait until any task finishes
+        await Task.WhenAny(clientReaderTask, upstreamWriterTask, upstreamReaderTask);
+        cts.Cancel();
+
+        // Cleanup
+        try { await Task.WhenAll(clientReaderTask, upstreamWriterTask, upstreamReaderTask); }
+        catch { }
+
+        await upstreamLock.WaitAsync();
+        try
+        {
+            if (currentUpstreamWs != null && currentUpstreamWs.State == WebSocketState.Open)
+            {
+                try { await currentUpstreamWs.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None); } catch { }
+            }
+        }
+        finally
+        {
+            upstreamLock.Release();
+            upstreamLock.Dispose();
+            currentUpstreamWs?.Dispose();
+        }
+
+        if (clientWs.State == WebSocketState.Open)
+        {
+            try { await clientWs.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Session finished", CancellationToken.None); } catch { }
+        }
+
+        _logger.LogInformation("[ws-proxy] WebSocket connection closed for {Path}", context.Request.Path);
+    }
+
+    private Uri BuildUpstreamUri(HttpContext context)
+    {
         var baseUrl = _settings.ElevenLabsBaseUrl
             .Replace("https://", "wss://")
             .Replace("http://", "ws://")
             .TrimEnd('/');
 
-        // Rebuild query string: replace xi-api-key with pool key,
-        // preserve all other query parameters
         var queryParams = context.Request.Query
             .Where(q => !q.Key.Equals("xi-api-key", StringComparison.OrdinalIgnoreCase))
             .Select(q => $"{Uri.EscapeDataString(q.Key)}={Uri.EscapeDataString(q.Value.ToString())}")
             .ToList();
 
-        var upstreamUri = new Uri($"{baseUrl}{context.Request.Path}?{string.Join("&", queryParams)}");
+        return new Uri($"{baseUrl}{context.Request.Path}?{string.Join("&", queryParams)}");
+    }
 
-        _logger.LogInformation("[ws-proxy] Connecting to upstream: {Uri}", upstreamUri);
-
-        // ── Connect to ElevenLabs upstream WebSocket ───────────────────
-        using var upstreamWs = new ClientWebSocket();
-
-        // Set the real API key as a header on the upstream connection
+    private async Task<ClientWebSocket?> ConnectUpstreamAsync(string apiKey, Uri upstreamUri, HttpContext context)
+    {
+        var upstreamWs = new ClientWebSocket();
         upstreamWs.Options.SetRequestHeader("xi-api-key", apiKey);
 
-        // Forward relevant headers from the client (except auth and hop-by-hop)
         foreach (var header in context.Request.Headers)
         {
             var key = header.Key;
@@ -109,120 +355,20 @@ public class WebSocketProxyMiddleware
             {
                 upstreamWs.Options.SetRequestHeader(key, header.Value.ToString());
             }
-            catch
-            {
-                // Some headers can't be set on ClientWebSocket — skip silently
-            }
+            catch { }
         }
 
         try
         {
-            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await upstreamWs.ConnectAsync(upstreamUri, connectCts.Token);
-        }
-        catch (WebSocketException ex)
-        {
-            _logger.LogError(ex, "[ws-proxy] Failed to connect to upstream WebSocket");
-            context.Response.StatusCode = 502;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsJsonAsync(new
-            {
-                error = "ws_upstream_error",
-                message = $"Failed to connect to ElevenLabs WebSocket: {ex.Message}"
-            });
-            return;
-        }
-
-        // ── Accept the client WebSocket ────────────────────────────────
-        using var clientWs = await context.WebSockets.AcceptWebSocketAsync();
-
-        _logger.LogInformation("[ws-proxy] WebSocket connection established, relaying frames");
-
-        // ── Relay frames bidirectionally ────────────────────────────────
-        // Two concurrent tasks: client→upstream and upstream→client.
-        // When either side closes, we signal the other to shut down.
-        using var cts = new CancellationTokenSource();
-
-        var clientToUpstream = RelayFrames(clientWs, upstreamWs, "client→upstream", cts);
-        var upstreamToClient = RelayFrames(upstreamWs, clientWs, "upstream→client", cts);
-
-        // Wait for either direction to finish (close or error)
-        await Task.WhenAny(clientToUpstream, upstreamToClient);
-
-        // Signal the other direction to stop
-        cts.Cancel();
-
-        // Wait for both to complete gracefully
-        try { await Task.WhenAll(clientToUpstream, upstreamToClient); }
-        catch (OperationCanceledException) { /* expected */ }
-
-        _logger.LogInformation("[ws-proxy] WebSocket connection closed for {Path}", context.Request.Path);
-    }
-
-    /// <summary>
-    /// Read frames from <paramref name="source"/> and write them to <paramref name="destination"/>
-    /// until the source sends a Close frame or the cancellation token fires.
-    /// </summary>
-    private async Task RelayFrames(
-        WebSocket source,
-        WebSocket destination,
-        string direction,
-        CancellationTokenSource cts)
-    {
-        var buffer = new byte[BufferSize];
-
-        try
-        {
-            while (!cts.Token.IsCancellationRequested
-                && source.State == WebSocketState.Open
-                && destination.State == WebSocketState.Open)
-            {
-                var result = await source.ReceiveAsync(
-                    new ArraySegment<byte>(buffer), cts.Token);
-
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    // Forward the close frame to the other side
-                    _logger.LogDebug("[ws-proxy] {Direction} close frame received", direction);
-
-                    if (destination.State == WebSocketState.Open)
-                    {
-                        await destination.CloseOutputAsync(
-                            result.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
-                            result.CloseStatusDescription,
-                            CancellationToken.None);
-                    }
-
-                    break;
-                }
-
-                // Forward the data frame (text or binary) to the other side
-                await destination.SendAsync(
-                    new ArraySegment<byte>(buffer, 0, result.Count),
-                    result.MessageType,
-                    result.EndOfMessage,
-                    cts.Token);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Other direction closed — normal shutdown
-        }
-        catch (WebSocketException ex) when (
-            ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely
-            || source.State != WebSocketState.Open)
-        {
-            // Connection dropped — expected during teardown
-            _logger.LogDebug("[ws-proxy] {Direction} connection dropped: {Message}", direction, ex.Message);
+            return upstreamWs;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[ws-proxy] {Direction} relay error", direction);
-        }
-        finally
-        {
-            // Signal the other direction to stop
-            cts.Cancel();
+            _logger.LogWarning("[ws-proxy] Failed to connect to upstream with key ...{Key}: {Message}", apiKey[^6..], ex.Message);
+            upstreamWs.Dispose();
+            return null;
         }
     }
 }
